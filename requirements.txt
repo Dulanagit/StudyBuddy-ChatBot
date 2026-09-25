@@ -1,0 +1,39 @@
+# ============================================================
+# StudyBuddy - RAG Chatbot Dependencies
+# ============================================================
+# LLM: Groq API (free, fast inference)
+# Embeddings: HuggingFace sentence-transformers (free, local)
+# Vector Store: ChromaDB 1.x (Python 3.14 pre-built wheels)
+# UI: Streamlit
+# Orchestration: LangChain (unpinned — let pip resolve for Python 3.14)
+#
+# NOTE: langchain-chroma 1.x requires langchain-core>=1.0, so the entire
+# LangChain stack must be on 1.x. We leave all LangChain packages unpinned
+# so pip can find a mutually compatible set on Python 3.14.
+# ============================================================
+
+# --- Core LangChain stack (unpinned — pip resolves compatible 1.x set) ---
+langchain
+langchain-core
+langchain-community
+langchain-text-splitters
+
+# --- Groq LLM integration ---
+langchain-groq
+
+# --- ChromaDB vector store (1.x has Python 3.14 pre-built wheels) ---
+chromadb>=1.0.0
+langchain-chroma>=1.0.0
+
+# --- HuggingFace embeddings (free, local, no API key needed) ---
+sentence-transformers
+langchain-huggingface
+
+# --- PDF processing ---
+pymupdf>=1.24.0
+
+# --- Streamlit UI ---
+streamlit>=1.39.0
+
+# --- Environment variable management ---
+python-dotenv>=1.0.0

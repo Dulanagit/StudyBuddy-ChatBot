@@ -1,0 +1,20 @@
+# Environment variables (contains your GROQ_API_KEY — never commit this)
+.env
+
+# ChromaDB vector store (auto-generated on first PDF upload)
+chroma_db/
+
+# Python cache files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# OS files
+.DS_Store
+Thumbs.db
