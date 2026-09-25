@@ -207,6 +207,27 @@ def init_session_state():
 
 init_session_state()
 
+# ---------------------------------------------------------------------------
+# Auto-initialize on startup
+# ---------------------------------------------------------------------------
+# If the app restarts (or the page is refreshed), session state is cleared but
+# ChromaDB and the processed-files registry persist on disk. This block
+# automatically reloads the vector store and builds the chain so the user
+# doesn't have to re-upload files just to enable the chat bar.
+
+if (
+    st.session_state.vector_store is None          # not yet loaded this session
+    and st.session_state.groq_api_key              # API key is available
+    and get_processed_files()                       # at least one file is embedded
+):
+    try:
+        st.session_state.vector_store = get_or_create_vector_store()
+        rebuild_chain()
+        logger.info("Auto-initialized vector store and chain from existing ChromaDB.")
+    except Exception as e:
+        logger.error(f"Auto-init failed: {e}")
+        # Non-fatal — user can still upload files to trigger manual init
+
 
 # ---------------------------------------------------------------------------
 # Helper — rebuild the chain (called when mode or key changes)
