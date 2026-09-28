@@ -12,6 +12,7 @@ Run with:
 """
 
 import os
+import re
 import time
 import logging
 
@@ -40,7 +41,7 @@ from chat_engine import (
 # Setup
 # ---------------------------------------------------------------------------
 
-# Load GROQ_API_KEY from .env file if present (optional — can also be entered in UI)
+# Load GROQ_API_KEY from .env file if present
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO)
@@ -48,6 +49,37 @@ logger = logging.getLogger(__name__)
 
 # Fixed session ID for this single-user Streamlit app
 SESSION_ID = "studybuddy_main_session"
+
+# ---------------------------------------------------------------------------
+# Security constants
+# ---------------------------------------------------------------------------
+
+# Maximum PDF upload size in megabytes — prevents DoS via huge files
+MAX_UPLOAD_MB = 20
+MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
+
+# Maximum characters allowed in a single user question — limits token cost abuse
+MAX_QUESTION_CHARS = 2000
+
+# Cap the number of messages kept in the display history — prevents memory growth
+MAX_CHAT_MESSAGES = 200
+
+
+def _get_api_key() -> str:
+    """
+    Reads the Groq API key DIRECTLY from the environment at call time.
+    The key is NEVER stored in st.session_state to prevent it from
+    persisting in server memory or leaking via session state inspection.
+    """
+    return os.getenv("GROQ_API_KEY", "")
+
+
+def _sanitize_text(value: str) -> str:
+    """
+    Strips angle brackets from a string before rendering it in the Streamlit UI.
+    Prevents XSS via crafted PDF filenames or metadata.
+    """
+    return re.sub(r"[<>]", "", str(value))
 
 # ---------------------------------------------------------------------------
 # Page configuration (must be the FIRST Streamlit call)
@@ -177,6 +209,11 @@ def init_session_state():
     Ensures all required session state keys are initialised on first load.
     Streamlit re-runs this file on every user interaction, so we guard
     each key with `if key not in st.session_state`.
+
+    SECURITY: The Groq API key is intentionally NOT stored in session_state.
+    It is read directly from the environment (os.getenv) at the moment it is
+    needed via _get_api_key(). This prevents the key from persisting in server
+    memory beyond the scope of a single call.
     """
     if "vector_store" not in st.session_state:
         st.session_state.vector_store = None       # Chroma instance
@@ -185,8 +222,28 @@ def init_session_state():
         st.session_state.chain = None              # RunnableWithMessageHistory
 
     if "messages" not in st.session_state:
-        # List of dicts: {"role": "user"|"assistant", "content": str, "sources": list|None}
-        st.session_state.messages = []
+        # Pre-built onboarding message shown to new users before any file is uploaded.
+        # This is a static string — no LLM call, zero tokens spent.
+        if not get_processed_files():
+            st.session_state.messages = [{
+                "role": "assistant",
+                "content": (
+                    "Hi there! 👋 I'm **StudyBuddy**, your AI-powered study assistant.\n\n"
+                    "Here's how to get started:\n\n"
+                    "1. 📄 **Upload your PDFs** — use the sidebar on the left to add your lecture "
+                    "slides, syllabi, or textbook chapters.\n"
+                    "2. ❓ **Ask anything** — once your files are processed, ask me any question "
+                    "about your course materials. I'll find the relevant passages and explain "
+                    "them clearly, with page references.\n"
+                    "3. 🔍 **Check sources** — every answer includes a \"View source passages\" "
+                    "section so you can verify exactly where the information came from.\n\n"
+                    "Feel free to ask me how anything works — I'm happy to help you get set up! 😊"
+                ),
+                "sources": None,
+            }]
+        else:
+            # Files already in KB — start with an empty history
+            st.session_state.messages = []
 
     if "use_outside_knowledge" not in st.session_state:
         st.session_state.use_outside_knowledge = False
@@ -200,12 +257,52 @@ def init_session_state():
             info["filename"] for info in get_processed_files().values()
         )
 
-    if "groq_api_key" not in st.session_state:
-        # Pre-fill from .env if available
-        st.session_state.groq_api_key = os.getenv("GROQ_API_KEY", "")
-
 
 init_session_state()
+
+# ---------------------------------------------------------------------------
+# Helper — rebuild the chain (called when mode or model/source changes)
+# ---------------------------------------------------------------------------
+
+def rebuild_chain():
+    """
+    (Re)builds the LangChain LCEL retrieval chain.
+    Called whenever the vector store, model, mode, or source selection changes.
+
+    SECURITY: The API key is fetched directly from the environment via
+    _get_api_key() and is NOT read from session_state.
+
+    SOURCE FILTER: Always passes the explicit selected_sources list to build_chain.
+    When no files are selected the chain is set to None so no retrieval can occur.
+    """
+    api_key = _get_api_key()
+    if not st.session_state.vector_store or not api_key:
+        return
+
+    selected = list(st.session_state.selected_sources)
+
+    # If nothing is selected, disable the chain entirely —
+    # passing None would search everything, which is the opposite of what we want.
+    if len(selected) == 0:
+        st.session_state.chain = None
+        logger.info("No sources selected — chain disabled.")
+        return
+
+    all_files = [info["filename"] for info in get_processed_files().values()]
+
+    # Always pass the selected list explicitly.
+    # build_chain treats None as "no filter" (search all), so we only pass None
+    # when every single file is selected — which is functionally equivalent.
+    sources_arg = None if len(selected) == len(all_files) else selected
+
+    st.session_state.chain = build_chain(
+        vector_store=st.session_state.vector_store,
+        groq_api_key=api_key,
+        use_outside_knowledge=st.session_state.use_outside_knowledge,
+        model_name=st.session_state.selected_model,
+        selected_sources=sources_arg,
+    )
+
 
 # ---------------------------------------------------------------------------
 # Auto-initialize on startup
@@ -217,7 +314,7 @@ init_session_state()
 
 if (
     st.session_state.vector_store is None          # not yet loaded this session
-    and st.session_state.groq_api_key              # API key is available
+    and _get_api_key()                              # API key is available in env
     and get_processed_files()                       # at least one file is embedded
 ):
     try:
@@ -230,31 +327,6 @@ if (
 
 
 # ---------------------------------------------------------------------------
-# Helper — rebuild the chain (called when mode or key changes)
-# ---------------------------------------------------------------------------
-
-def rebuild_chain():
-    """
-    (Re)builds the LangChain LCEL retrieval chain.
-    Called whenever the vector store, API key, model, mode, or
-    source selection changes.
-    """
-    if st.session_state.vector_store and st.session_state.groq_api_key:
-        # Determine active source filter
-        selected = list(st.session_state.selected_sources)
-        all_files = [info["filename"] for info in get_processed_files().values()]
-        # If all files are selected, pass None (no filter = search everything)
-        use_filter = 0 < len(selected) < len(all_files)
-        st.session_state.chain = build_chain(
-            vector_store=st.session_state.vector_store,
-            groq_api_key=st.session_state.groq_api_key,
-            use_outside_knowledge=st.session_state.use_outside_knowledge,
-            model_name=st.session_state.selected_model,
-            selected_sources=selected if use_filter else None,
-        )
-
-
-# ---------------------------------------------------------------------------
 # SIDEBAR
 # ---------------------------------------------------------------------------
 
@@ -264,29 +336,14 @@ with st.sidebar:
     st.markdown("*Your AI-powered study companion*")
     st.divider()
 
-    # ---- API Key section ----
-    st.markdown('<p class="sidebar-section">🔑 Groq API Key</p>', unsafe_allow_html=True)
-
-    groq_key_input = st.text_input(
-        label="Groq API Key",
-        value=st.session_state.groq_api_key,
-        type="password",
-        placeholder="gsk_...",
-        help="Get your free key at console.groq.com",
-        label_visibility="collapsed",
-    )
-
-    # Update session state and rebuild chain if key changed
-    if groq_key_input != st.session_state.groq_api_key:
-        st.session_state.groq_api_key = groq_key_input
-        rebuild_chain()
-
-    if not st.session_state.groq_api_key:
-        st.warning("⚠️ Enter your Groq API key to start chatting.", icon="🔑")
-    else:
-        st.success("API key loaded ✅", icon="🔑")
-
-    st.divider()
+    # ---- API key is loaded silently from environment (.env / server env vars) ----
+    # No UI input is exposed to avoid leaking secrets in a public-facing app.
+    if not _get_api_key():
+        st.error(
+            "⚠️ No Groq API key found. "
+            "Please set the `GROQ_API_KEY` environment variable on the server.",
+            icon="🔑",
+        )
 
     # ---- Model selector ----
     st.markdown('<p class="sidebar-section">🤖 Model</p>', unsafe_allow_html=True)
@@ -359,15 +416,24 @@ with st.sidebar:
                     st.session_state.vector_store = get_or_create_vector_store()
                     rebuild_chain()
                 except Exception as e:
-                    st.error(f"Failed to initialise vector store: {e}")
+                    st.error("Failed to initialise vector store. Please try again.")
                     logger.error(f"Vector store init error: {e}")
 
         for uploaded_file in uploaded_files:
             file_bytes = uploaded_file.read()
 
-            # Guard against empty files
+            # Guard: reject empty files
             if len(file_bytes) == 0:
-                st.warning(f"⚠️ '{uploaded_file.name}' is empty — skipping.", icon="📄")
+                st.warning(f"⚠️ '{_sanitize_text(uploaded_file.name)}' is empty — skipping.", icon="📄")
+                continue
+
+            # Guard: enforce maximum upload size to prevent DoS
+            if len(file_bytes) > MAX_UPLOAD_BYTES:
+                st.error(
+                    f"❌ '{_sanitize_text(uploaded_file.name)}' exceeds the {MAX_UPLOAD_MB} MB limit "
+                    f"({len(file_bytes) / 1024 / 1024:.1f} MB). Please use a smaller file.",
+                    icon="📄",
+                )
                 continue
 
             file_hash = compute_file_hash(file_bytes)
@@ -396,17 +462,20 @@ with st.sidebar:
 
                 except ValueError as e:
                     # E.g. image-only PDF with no text
-                    st.error(f"❌ **{uploaded_file.name}**: {e}", icon="📄")
+                    safe_name = _sanitize_text(uploaded_file.name)
+                    st.error(f"❌ **{safe_name}**: {_sanitize_text(str(e))}", icon="📄")
                     logger.warning(f"ValueError for '{uploaded_file.name}': {e}")
 
                 except RuntimeError as e:
-                    # E.g. corrupt PDF or ChromaDB failure
-                    st.error(f"❌ **{uploaded_file.name}**: {e}", icon="⚠️")
+                    safe_name = _sanitize_text(uploaded_file.name)
+                    # Log the real error but show a generic message to the user
+                    st.error(f"❌ **{safe_name}**: Could not process this file. It may be corrupt.", icon="⚠️")
                     logger.error(f"RuntimeError for '{uploaded_file.name}': {e}")
 
                 except Exception as e:
-                    st.error(f"❌ Unexpected error processing '{uploaded_file.name}': {e}")
-                    logger.exception(f"Unexpected error: {e}")
+                    safe_name = _sanitize_text(uploaded_file.name)
+                    st.error(f"❌ Unexpected error processing '{safe_name}'. Please try again.")
+                    logger.exception(f"Unexpected error for '{uploaded_file.name}': {e}")
 
     st.divider()
 
@@ -462,6 +531,19 @@ with st.sidebar:
 
         if selection_changed:
             rebuild_chain()
+            # Clear conversation history so the LLM cannot recall content
+            # from files that were just deselected. Without this, the model's
+            # context window still contains previously seen passages.
+            clear_session_history(SESSION_ID)
+            st.session_state.messages = [{
+                "role": "assistant",
+                "content": (
+                    "🔄 **Knowledge base selection changed.** "
+                    "Chat history has been cleared to ensure I only answer "
+                    "from your currently selected files."
+                ),
+                "sources": None,
+            }]
 
         # Status hint when files are partially selected
         n_active = len(st.session_state.selected_sources & all_filenames)
@@ -547,8 +629,9 @@ for message in st.session_state.messages:
         if message["role"] == "assistant" and message.get("sources"):
             with st.expander("📎 View source passages", expanded=False):
                 for i, source in enumerate(message["sources"], start=1):
-                    src_name = source.metadata.get("source", "Unknown")
-                    src_page = source.metadata.get("page", "?")
+                    # Sanitize metadata values before rendering to prevent XSS
+                    src_name = _sanitize_text(source.metadata.get("source", "Unknown"))
+                    src_page = _sanitize_text(str(source.metadata.get("page", "?")))
                     st.markdown(
                         f"**Passage {i}** · `{src_name}` · Page {src_page}\n\n"
                         f"> {source.page_content[:400]}{'...' if len(source.page_content) > 400 else ''}"
@@ -561,18 +644,24 @@ for message in st.session_state.messages:
 # ---------------------------------------------------------------------------
 
 user_input = st.chat_input(
-    placeholder="Ask a question about your uploaded materials...",
-    disabled=(st.session_state.chain is None),
+    placeholder="Ask me anything — about your materials or how to use StudyBuddy...",
 )
 
 if user_input:
-    # Guard: must have a chain (i.e. vector store ready + API key set)
-    if not st.session_state.chain:
-        st.error(
-            "Please upload at least one PDF and enter your Groq API key before asking questions.",
-            icon="⚠️",
+    # Security: strip whitespace and enforce maximum question length
+    user_input = user_input.strip()
+    if len(user_input) > MAX_QUESTION_CHARS:
+        st.warning(
+            f"⚠️ Your question is too long ({len(user_input)} characters). "
+            f"Please keep it under {MAX_QUESTION_CHARS} characters.",
+            icon="✂️",
         )
         st.stop()
+
+    # Security: cap message history size to prevent unbounded memory growth
+    if len(st.session_state.messages) >= MAX_CHAT_MESSAGES:
+        # Drop the oldest pair (user + assistant) to stay within limit
+        st.session_state.messages = st.session_state.messages[2:]
 
     # Display the user's message immediately
     with st.chat_message("user", avatar="🧑‍🎓"):
@@ -580,6 +669,23 @@ if user_input:
 
     # Append user message to display history
     st.session_state.messages.append({"role": "user", "content": user_input, "sources": None})
+
+    # Guard: if no chain is available, explain why and stop — no crash, no red error
+    if not st.session_state.chain:
+        no_chain_reply = (
+            "I'd love to help, but it looks like **no files are currently selected** "
+            "in your knowledge base. 📂\n\n"
+            "Please tick at least one file in the sidebar under **Knowledge Base** "
+            "to allow me to search your materials, then ask your question again."
+        )
+        with st.chat_message("assistant", avatar="🎓"):
+            st.markdown(no_chain_reply)
+        st.session_state.messages.append({
+            "role": "assistant",
+            "content": no_chain_reply,
+            "sources": None,
+        })
+        st.stop()
 
     # Call the chain and stream the response
     with st.chat_message("assistant", avatar="🎓"):
@@ -614,8 +720,9 @@ if user_input:
             if source_docs:
                 with st.expander("📎 View source passages", expanded=False):
                     for i, doc in enumerate(source_docs, start=1):
-                        src_name = doc.metadata.get("source", "Unknown")
-                        src_page = doc.metadata.get("page", "?")
+                        # Sanitize metadata before rendering to prevent XSS
+                        src_name = _sanitize_text(doc.metadata.get("source", "Unknown"))
+                        src_page = _sanitize_text(str(doc.metadata.get("page", "?")))
                         st.markdown(
                             f"**Passage {i}** · `{src_name}` · Page {src_page}\n\n"
                             f"> {doc.page_content[:400]}{'...' if len(doc.page_content) > 400 else ''}"
@@ -631,18 +738,22 @@ if user_input:
             })
 
         except Exception as e:
-            error_msg = f"❌ An error occurred while generating the response: {e}"
+            # Log the full exception server-side for debugging
+            logger.error(f"Chain invocation error: {e}")
 
-            # Common Groq API error hints
-            if "401" in str(e) or "authentication" in str(e).lower():
-                error_msg = "❌ Invalid Groq API key. Please check the key in the sidebar."
-            elif "429" in str(e) or "rate limit" in str(e).lower():
+            # Show a generic, safe message to the user — never expose raw exception
+            # details which could leak internal paths, keys, or stack traces
+            err_str = str(e).lower()
+            if "401" in err_str or "authentication" in err_str:
+                error_msg = "❌ API authentication failed. The server API key may be invalid."
+            elif "429" in err_str or "rate limit" in err_str:
                 error_msg = "❌ Rate limit reached. Please wait a moment before asking another question."
-            elif "connection" in str(e).lower() or "timeout" in str(e).lower():
-                error_msg = "❌ Network error — could not reach Groq API. Check your internet connection."
+            elif "connection" in err_str or "timeout" in err_str:
+                error_msg = "❌ Network error — could not reach the AI service. Check your internet connection."
+            else:
+                error_msg = "❌ An error occurred while generating the response. Please try again."
 
             response_placeholder.error(error_msg)
-            logger.error(f"Chain invocation error: {e}")
 
             # Append the error as an assistant message so the history is consistent
             st.session_state.messages.append({
