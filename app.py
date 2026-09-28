@@ -264,27 +264,14 @@ with st.sidebar:
     st.markdown("*Your AI-powered study companion*")
     st.divider()
 
-    # ---- API Key section ----
-    st.markdown('<p class="sidebar-section">🔑 Groq API Key</p>', unsafe_allow_html=True)
-
-    groq_key_input = st.text_input(
-        label="Groq API Key",
-        value=st.session_state.groq_api_key,
-        type="password",
-        placeholder="gsk_...",
-        help="Get your free key at console.groq.com",
-        label_visibility="collapsed",
-    )
-
-    # Update session state and rebuild chain if key changed
-    if groq_key_input != st.session_state.groq_api_key:
-        st.session_state.groq_api_key = groq_key_input
-        rebuild_chain()
-
+    # ---- API key is loaded silently from environment (.env / server env vars) ----
+    # No UI input is exposed to avoid leaking secrets in a public-facing app.
     if not st.session_state.groq_api_key:
-        st.warning("⚠️ Enter your Groq API key to start chatting.", icon="🔑")
-    else:
-        st.success("API key loaded ✅", icon="🔑")
+        st.error(
+            "⚠️ No Groq API key found. "
+            "Please set the `GROQ_API_KEY` environment variable on the server.",
+            icon="🔑",
+        )
 
     st.divider()
 
