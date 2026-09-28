@@ -222,8 +222,28 @@ def init_session_state():
         st.session_state.chain = None              # RunnableWithMessageHistory
 
     if "messages" not in st.session_state:
-        # List of dicts: {"role": "user"|"assistant", "content": str, "sources": list|None}
-        st.session_state.messages = []
+        # Pre-built onboarding message shown to new users before any file is uploaded.
+        # This is a static string — no LLM call, zero tokens spent.
+        if not get_processed_files():
+            st.session_state.messages = [{
+                "role": "assistant",
+                "content": (
+                    "Hi there! 👋 I'm **StudyBuddy**, your AI-powered study assistant.\n\n"
+                    "Here's how to get started:\n\n"
+                    "1. 📄 **Upload your PDFs** — use the sidebar on the left to add your lecture "
+                    "slides, syllabi, or textbook chapters.\n"
+                    "2. ❓ **Ask anything** — once your files are processed, ask me any question "
+                    "about your course materials. I'll find the relevant passages and explain "
+                    "them clearly, with page references.\n"
+                    "3. 🔍 **Check sources** — every answer includes a \"View source passages\" "
+                    "section so you can verify exactly where the information came from.\n\n"
+                    "Feel free to ask me how anything works — I'm happy to help you get set up! 😊"
+                ),
+                "sources": None,
+            }]
+        else:
+            # Files already in KB — start with an empty history
+            st.session_state.messages = []
 
     if "use_outside_knowledge" not in st.session_state:
         st.session_state.use_outside_knowledge = False
@@ -251,21 +271,37 @@ def rebuild_chain():
 
     SECURITY: The API key is fetched directly from the environment via
     _get_api_key() and is NOT read from session_state.
+
+    SOURCE FILTER: Always passes the explicit selected_sources list to build_chain.
+    When no files are selected the chain is set to None so no retrieval can occur.
     """
     api_key = _get_api_key()
-    if st.session_state.vector_store and api_key:
-        # Determine active source filter
-        selected = list(st.session_state.selected_sources)
-        all_files = [info["filename"] for info in get_processed_files().values()]
-        # If all files are selected, pass None (no filter = search everything)
-        use_filter = 0 < len(selected) < len(all_files)
-        st.session_state.chain = build_chain(
-            vector_store=st.session_state.vector_store,
-            groq_api_key=api_key,
-            use_outside_knowledge=st.session_state.use_outside_knowledge,
-            model_name=st.session_state.selected_model,
-            selected_sources=selected if use_filter else None,
-        )
+    if not st.session_state.vector_store or not api_key:
+        return
+
+    selected = list(st.session_state.selected_sources)
+
+    # If nothing is selected, disable the chain entirely —
+    # passing None would search everything, which is the opposite of what we want.
+    if len(selected) == 0:
+        st.session_state.chain = None
+        logger.info("No sources selected — chain disabled.")
+        return
+
+    all_files = [info["filename"] for info in get_processed_files().values()]
+
+    # Always pass the selected list explicitly.
+    # build_chain treats None as "no filter" (search all), so we only pass None
+    # when every single file is selected — which is functionally equivalent.
+    sources_arg = None if len(selected) == len(all_files) else selected
+
+    st.session_state.chain = build_chain(
+        vector_store=st.session_state.vector_store,
+        groq_api_key=api_key,
+        use_outside_knowledge=st.session_state.use_outside_knowledge,
+        model_name=st.session_state.selected_model,
+        selected_sources=sources_arg,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -495,6 +531,19 @@ with st.sidebar:
 
         if selection_changed:
             rebuild_chain()
+            # Clear conversation history so the LLM cannot recall content
+            # from files that were just deselected. Without this, the model's
+            # context window still contains previously seen passages.
+            clear_session_history(SESSION_ID)
+            st.session_state.messages = [{
+                "role": "assistant",
+                "content": (
+                    "🔄 **Knowledge base selection changed.** "
+                    "Chat history has been cleared to ensure I only answer "
+                    "from your currently selected files."
+                ),
+                "sources": None,
+            }]
 
         # Status hint when files are partially selected
         n_active = len(st.session_state.selected_sources & all_filenames)
@@ -595,19 +644,10 @@ for message in st.session_state.messages:
 # ---------------------------------------------------------------------------
 
 user_input = st.chat_input(
-    placeholder="Ask a question about your uploaded materials...",
-    disabled=(st.session_state.chain is None),
+    placeholder="Ask me anything — about your materials or how to use StudyBuddy...",
 )
 
 if user_input:
-    # Guard: must have a chain (i.e. vector store ready + API key set)
-    if not st.session_state.chain:
-        st.error(
-            "Please upload at least one PDF before asking questions.",
-            icon="⚠️",
-        )
-        st.stop()
-
     # Security: strip whitespace and enforce maximum question length
     user_input = user_input.strip()
     if len(user_input) > MAX_QUESTION_CHARS:
@@ -629,6 +669,23 @@ if user_input:
 
     # Append user message to display history
     st.session_state.messages.append({"role": "user", "content": user_input, "sources": None})
+
+    # Guard: if no chain is available, explain why and stop — no crash, no red error
+    if not st.session_state.chain:
+        no_chain_reply = (
+            "I'd love to help, but it looks like **no files are currently selected** "
+            "in your knowledge base. 📂\n\n"
+            "Please tick at least one file in the sidebar under **Knowledge Base** "
+            "to allow me to search your materials, then ask your question again."
+        )
+        with st.chat_message("assistant", avatar="🎓"):
+            st.markdown(no_chain_reply)
+        st.session_state.messages.append({
+            "role": "assistant",
+            "content": no_chain_reply,
+            "sources": None,
+        })
+        st.stop()
 
     # Call the chain and stream the response
     with st.chat_message("assistant", avatar="🎓"):
