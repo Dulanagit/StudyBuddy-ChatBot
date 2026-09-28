@@ -138,18 +138,21 @@ def _save_processed_registry(registry: dict) -> None:
 
 def compute_file_hash(file_bytes: bytes) -> str:
     """
-    Computes an MD5 hash of raw file bytes for duplicate detection.
+    Computes a SHA-256 hash of raw file bytes for duplicate detection.
 
     Using content hash (not filename) ensures the same file uploaded under
     a different name is correctly identified as a duplicate.
+
+    SHA-256 is used instead of MD5 because MD5 is cryptographically broken
+    and trivially vulnerable to collision attacks.
 
     Args:
         file_bytes (bytes): Raw bytes of the uploaded file.
 
     Returns:
-        str: Hex-encoded MD5 digest.
+        str: Hex-encoded SHA-256 digest.
     """
-    return hashlib.md5(file_bytes).hexdigest()
+    return hashlib.sha256(file_bytes).hexdigest()
 
 
 def is_file_processed(file_hash: str) -> bool:
