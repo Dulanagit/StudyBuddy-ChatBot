@@ -273,8 +273,6 @@ with st.sidebar:
             icon="🔑",
         )
 
-    st.divider()
-
     # ---- Model selector ----
     st.markdown('<p class="sidebar-section">🤖 Model</p>', unsafe_allow_html=True)
 
